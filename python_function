@@ -6,7 +6,7 @@ def createCollection(p_collection_name):
     else:
         collections[p_collection_name] = [ ]
         return f"Collection {p_collection_name} created."
-def indexData(p_collection_name, p_exclude_column):
+def indexData(p_collection_name, p_exclude_column): 
     """Indexes the employee data excluding a specific column."""
     collection = collections.get(p_collection_name)
     if not collection:
