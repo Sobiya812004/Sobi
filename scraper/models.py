@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-from typing import Optional
+from datetime import datetime
+from typing import Any, Optional
 
 
 @dataclass
@@ -68,3 +69,17 @@ class Product:
             output              = output,
             status              = status,
         )
+
+
+@dataclass
+class Session:
+    """A request-method session. Cookies and the oapv template are captured together
+    in the same Chrome and are only valid together, so they live in one object and are
+    always replaced as a whole (never modified in place).
+
+    validated=False until the first real request made with this session succeeds."""
+    requests_session: Any
+    oapv_template: str
+    session_id: str
+    created_at: datetime
+    validated: bool = False

@@ -6,14 +6,18 @@ import random
 import uuid
 import boto3
 import requests as http_requests
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Optional
 
 from worker.scraper.config import (
     IMDS_TOKEN_URL, IMDS_INSTANCE_URL, IMDS_SPOT_URL,
     DELAY_MIN, DELAY_MAX, AWS_REGION, QUEUE_IDLE_TIMEOUT,
+    MAX_RETRIES, CAPTCHA_MAX_RETRIES, CAPTCHA_DELAY_MIN, CAPTCHA_DELAY_MAX,
 )
-from worker.scraper.models import Request, Product
-from worker.scraper.scraper import Scraper, CaptchaError, SessionExpiredError
+from worker.scraper.models import Request, Product, Session
+from worker.scraper.scraper import Scraper, CaptchaError, SessionExpiredError, ChromeInitError
 from worker.scraper.queue_service import QueueService
 
 logging.basicConfig(
@@ -21,6 +25,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
 
 _shutdown = False
 
@@ -99,7 +104,32 @@ def terminate_for_fresh_ip():
         logger.error("Failed to terminate for fresh IP: %s", e)
 
 
+
 # ------------------helpers------------------
+
+class CaptchaPersistsError(Exception):
+    """CAPTCHA was still shown after all retries with a new Chrome."""
+
+
+@dataclass
+class Item:
+    """One parsed input message."""
+    msg: dict
+    req: Request
+
+
+@dataclass
+class WorkerContext:
+    """Everything the processing functions share for the life of the worker."""
+    queue: QueueService
+    scraper: Scraper
+    items: deque = field(default_factory=deque)      # parsed items of the current batch still to do
+    pending: list = field(default_factory=list)      # SQS messages of the current batch not yet finished
+    session: Optional[Session] = None                # current request-method session
+    fresh_fail: int = 0                              # consecutive first-use failures of fresh sessions
+    processed: int = 0
+    captcha_count: int = 0
+
 
 def build_requests_session(browser_cookies: list) -> http_requests.Session:
     session = http_requests.Session()
@@ -107,26 +137,36 @@ def build_requests_session(browser_cookies: list) -> http_requests.Session:
         session.cookies.set(c["name"], c["value"], domain=c.get("domain", ".google.com"))
     return session
 
-def new_session(scraper) -> tuple:
-    """Build a fresh requests session from the current browser cookies, tagging it
-    with a unique session_id and creation timestamp so it can be traced end-to-end."""
+
+def build_session(scraper: Scraper, oapv_template: str) -> Session:
+    """Build a Session from the CURRENT browser cookies and the template that was captured in
+    the same Chrome. It starts unvalidated; the first real request made with it validates it."""
     session_id = uuid.uuid4().hex[:12]
     created_at = datetime.now()
-    session = build_requests_session(scraper.driver.get_cookies())
-    logger.info("Session created: session_id=%s created_at=%s", session_id, created_at.isoformat())
-    return session, session_id, created_at
+    session = Session(
+        requests_session=build_requests_session(scraper.driver.get_cookies()),
+        oapv_template=oapv_template,
+        session_id=session_id,
+        created_at=created_at,
+        validated=False,
+    )
+    logger.info("SESSION_COLLECTED session_id=%s created_at=%s", session_id, created_at.isoformat())
+    return session
 
-def log_session_expired(session_id: str, created_at: datetime):
+
+def log_session_expired(session: Optional[Session]):
     """Log how long a session stayed valid before it expired."""
-    if not session_id or not created_at:
+    if not session:
         return
-    valid_period_s = (datetime.now() - created_at).total_seconds()
-    logger.info("Session expired: session_id=%s valid_period_s=%.1f", session_id, valid_period_s)
+    valid_period_s = (datetime.now() - session.created_at).total_seconds()
+    logger.info("Session expired: session_id=%s valid_period_s=%.1f", session.session_id, valid_period_s)
+
 
 def log_session_payload(session_id: str, strike_id: str, payload_ms: int):
     """Log the time taken to fetch a payload (oapv/HTML response) using a given session."""
     logger.info("Session payload: session_id=%s strike_id=%s payload_ms=%d",
                 session_id, strike_id, payload_ms)
+
 
 def format_output(sellers) -> str:
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -147,44 +187,237 @@ def send_and_delete(queue, msg, req, sellers, scrape_ms: int = 0):
                 req.client_name, req.strike_id, status, len(sellers), scrape_ms)
 
 
-def _forward_on_error(queue: QueueService, msg: dict):
-    """On error: return to queue — SQS's redrive policy (maxReceiveCount)
-    promotes it to DLQ automatically after retries."""
-    queue.return_message(msg)
-    logger.info("Error: returned to queue for retry (SQS redrive handles DLQ)")
+def finish(ctx: WorkerContext, item: Item, sellers, scrape_ms: int = 0):
+    """Send the output, delete the message and remove it from the pending list."""
+    send_and_delete(ctx.queue, item.msg, item.req, sellers, scrape_ms)
+    if item.msg in ctx.pending:
+        ctx.pending.remove(item.msg)
+    ctx.processed += 1
 
 
-def _browser_navigate_with_retry(scraper, url: str, seller_limit: int):
-    """Navigate Chrome to URL for session refresh.
-    On captcha: WARNING + restart driver + full scrape_and_capture_template to properly
-    warm up the new session (plain navigation after restart doesn't give OAPV-valid cookies).
-    Returns (sellers, oapv_template) if restart occurred — caller uses browser result directly.
-    Returns (None, None) if no captcha — caller should refresh cookies and retry via requests.
-    Raises CaptchaError if captcha persists after restart."""
-    scraper.driver.get(url)
-    scraper.wait_for_page_ready()
-    if "This page checks to see if it's really you" in scraper.driver.page_source:
-        logger.warning("CAPTCHA during browser navigation — restarting driver once")
-        scraper.restart()
-        sellers, template = scraper.scrape_and_capture_template(url, seller_limit)
-        return sellers, template
-    return None, None
+def return_item(ctx: WorkerContext, item: Item):
+    """Give one message back to the queue (hidden RETURN_DELAY_SEC, then visible again).
+    SQS's redrive policy (maxReceiveCount) moves it to the DLQ after too many receives."""
+    ctx.queue.return_message(item.msg)
+    if item.msg in ctx.pending:
+        ctx.pending.remove(item.msg)
+    logger.info("Returned to queue for retry: strike_id=%s", item.req.strike_id)
+
+
+def handle_bad_message(ctx: WorkerContext, msg: dict, error: Exception):
+    """Unparseable / incomplete message: it would fail every time, so it is not retried.
+    Log the full body, store it in the DLQ with the reason, then delete it. If the DLQ
+    send fails the message is returned instead, so nothing is lost."""
+    logger.error("Bad message %s: %s | body=%s", msg.get("MessageId"), error, msg.get("Body"))
+    if ctx.queue.send_to_dlq(msg, f"{type(error).__name__}: {error}"):
+        ctx.queue.delete_message(msg)
+    else:
+        ctx.queue.return_message(msg)
+    if msg in ctx.pending:
+        ctx.pending.remove(msg)
 
 
 def captcha_terminate(queue, pending_messages, scraper):
-    for msg in pending_messages:
+    """CAPTCHA persists even with a new Chrome: return every unfinished message, stop Chrome
+    and terminate this instance so the ASG launches a replacement with a fresh IP."""
+    for msg in list(pending_messages):
         try:
-            # Return to queue — SQS's redrive policy promotes to DLQ after maxReceiveCount retries.
             queue.return_message(msg)
             logger.info("Captcha: returned %s to queue",
                         json.loads(msg["Body"]).get("strike_id", "?"))
         except Exception as e:
-            logger.error("Failed to handle captcha message: %s — returning to queue", e)
-            queue.return_message(msg)
+            logger.error("Failed to return captcha message: %s", e)
 
     scraper.stop()
     terminate_for_fresh_ip()
     _handle_signal(None, None)
+
+
+# ------------------Selenium fallback------------------
+
+def _open_chrome(ctx: WorkerContext):
+    """Open Chrome lazily. Raises ChromeInitError after all start attempts failed."""
+    if not ctx.scraper.is_running:
+        logger.info("SELENIUM_OPENED")
+        ctx.scraper.start()
+
+
+def _return_after_chrome_failure(ctx: WorkerContext, current: Item):
+    """Chrome could not be started. With a usable session only the message that needed
+    Chrome is returned; without a session every pending message needs Selenium too."""
+    if ctx.session is not None:
+        return_item(ctx, current)
+        return
+    logger.error("Chrome failed and no session exists — returning all %d pending messages",
+                 len(ctx.pending))
+    for msg in list(ctx.pending):
+        ctx.queue.return_message(msg)
+    ctx.pending.clear()
+    ctx.items.clear()
+
+
+def _next_item(ctx: WorkerContext) -> Optional[Item]:
+    """Next input of the batch for the same Chrome (Case B), or None."""
+    if _shutdown or is_spot_interrupted() or not ctx.items:
+        return None
+    ctx.queue.extend_visibility(ctx.pending)                 # heartbeat before each message
+    return ctx.items.popleft()
+
+
+def run_selenium_fallback(ctx: WorkerContext, first: Item, trigger: str):
+    """
+    Selenium fallback used when there is no session, the session expired, or the request
+    method returned NO_SELLER / was blocked. One Chrome is reused across inputs and is ALWAYS
+    quit at the end (finally).
+
+      Case A  sellers + "More stores" worked -> send OK, build session, quit Chrome.
+      Case B  sellers, no (working) "More stores" -> send OK from the DOM, NO session,
+              same Chrome loads the next input of the batch.
+      Case C  no sellers -> quit Chrome, new Chrome, retry (MAX_RETRIES times), then final
+              NO_SELLERS. Never collects a session; the existing session is kept.
+
+    Raises CaptchaPersistsError when the CAPTCHA does not go away (caller terminates).
+    """
+    scraper = ctx.scraper
+    current: Optional[Item] = first
+    no_seller_attempt = 0
+    captcha_retries = 0
+    t0 = datetime.now()
+
+    ctx.queue.extend_visibility(ctx.pending)                 # heartbeat before the fallback
+    try:
+        _open_chrome(ctx)
+        while current is not None:
+            req = current.req
+            scraper.context = req.strike_id
+            try:
+                result = scraper.scrape_browser(req.google_shopping_url, req.seller_limit,
+                                                need_session=True)
+            except CaptchaError:
+                if captcha_retries >= CAPTCHA_MAX_RETRIES:
+                    raise CaptchaPersistsError(f"CAPTCHA persists on {req.strike_id}")
+                captcha_retries += 1
+                logger.warning("CAPTCHA_RETRY(%d/%d) strike_id=%s",
+                               captcha_retries, CAPTCHA_MAX_RETRIES, req.strike_id)
+                scraper.stop()
+                logger.info("CHROME_QUIT")
+                time.sleep(random.uniform(CAPTCHA_DELAY_MIN, CAPTCHA_DELAY_MAX))
+                _open_chrome(ctx)
+                continue
+            except (ChromeInitError, CaptchaPersistsError):
+                raise
+            except Exception as e:
+                logger.error("Selenium error on %s: %s", req.strike_id, e, exc_info=True)
+                return_item(ctx, current)
+                return
+
+            try:
+                if result.sellers:
+                    logger.info("SELLERS_FOUND strike_id=%s sellers=%d more_stores=%s template=%s",
+                                req.strike_id, len(result.sellers), result.has_more_stores,
+                                bool(result.oapv_template))
+                    if trigger == "no_seller" and current is first:
+                        logger.info("FALSE_NO_SELLER_FROM_REQUEST strike_id=%s — browser found sellers",
+                                    req.strike_id)
+                    scrape_ms = int((datetime.now() - t0).total_seconds() * 1000)
+
+                    if result.oapv_template:                              # Case A
+                        # Build the session BEFORE Chrome is quit (cookies come from the driver).
+                        ctx.session = build_session(scraper, result.oapv_template)
+                        finish(ctx, current, result.sellers, scrape_ms)
+                        return
+
+                    # Case B: no session can be collected from this URL
+                    logger.info("MORE_STORES_MISSING_TRY_NEXT strike_id=%s (more_stores_button=%s)",
+                                req.strike_id, result.has_more_stores)
+                    finish(ctx, current, result.sellers, scrape_ms)
+                    current = _next_item(ctx)
+                    no_seller_attempt = 0
+                    captcha_retries = 0
+                    t0 = datetime.now()
+                    continue
+
+                # Case C: no sellers in the browser
+                if no_seller_attempt < MAX_RETRIES:
+                    no_seller_attempt += 1
+                    logger.info("RETRY_NEW_CHROME(%d/%d) strike_id=%s reason=%s",
+                                no_seller_attempt, MAX_RETRIES, req.strike_id,
+                                result.no_sellers_reason or "no_sellers")
+                    scraper.restart()                                    # quit + brand new Chrome
+                    continue
+                logger.info("FINAL_NO_SELLER strike_id=%s reason=%s",
+                            req.strike_id, result.no_sellers_reason or "no_sellers")
+                finish(ctx, current, [], int((datetime.now() - t0).total_seconds() * 1000))
+                return                                                   # old session is kept
+            except ChromeInitError:
+                raise
+            except Exception as e:
+                logger.error("Error finishing %s: %s", req.strike_id, e, exc_info=True)
+                return_item(ctx, current)
+                return
+    except ChromeInitError as e:
+        logger.error("Chrome could not be started: %s", e)
+        _return_after_chrome_failure(ctx, current if current is not None else first)
+    finally:
+        scraper.stop()
+        logger.info("CHROME_QUIT")
+
+
+# ------------------request method------------------
+
+def process_item(ctx: WorkerContext, item: Item):
+    """Process one input: request method when a session exists, otherwise Selenium."""
+    req = item.req
+    ctx.scraper.context = req.strike_id
+    logger.info("[%d] %s | client=%s strike_id=%s", ctx.processed + 1,
+                "requests" if ctx.session else "browser", req.client_name, req.strike_id)
+
+    if ctx.session is None:
+        run_selenium_fallback(ctx, item, trigger="no_session")
+        return
+
+    session = ctx.session
+    t0 = datetime.now()
+    try:
+        payload_t0 = datetime.now()
+        sellers = ctx.scraper.scrape_via_requests(
+            req.google_shopping_url, session.requests_session,
+            session.oapv_template, req.seller_limit,
+        )
+        log_session_payload(session.session_id, req.strike_id,
+                            int((datetime.now() - payload_t0).total_seconds() * 1000))
+    except SessionExpiredError as e:            # must come before CaptchaError (subclass)
+        logger.warning("Session expired on %s: %s", req.strike_id, e)
+        log_session_expired(session)
+        ctx.session = None                      # known bad — replace it
+        if not session.validated:
+            ctx.fresh_fail += 1
+            if ctx.fresh_fail >= 2:
+                logger.error("Fresh session failed on first use %d times in a row — "
+                             "returning %s instead of opening Chrome again", ctx.fresh_fail, req.strike_id)
+                ctx.fresh_fail = 0
+                return_item(ctx, item)
+                return
+        run_selenium_fallback(ctx, item, trigger="session_expired")
+        return
+    except CaptchaError as e:
+        logger.warning("Requests blocked on %s: %s — checking with a browser", req.strike_id, e)
+        time.sleep(random.uniform(CAPTCHA_DELAY_MIN, CAPTCHA_DELAY_MAX))
+        run_selenium_fallback(ctx, item, trigger="request_captcha")
+        return
+
+    if not sellers:
+        logger.info("NO_SELLER_FROM_REQUEST strike_id=%s — verifying in Selenium", req.strike_id)
+        run_selenium_fallback(ctx, item, trigger="no_seller")
+        return
+
+    if not session.validated:
+        session.validated = True
+        logger.info("SESSION_VALIDATED session_id=%s", session.session_id)
+    ctx.fresh_fail = 0
+    scrape_ms = int((datetime.now() - t0).total_seconds() * 1000)
+    finish(ctx, item, sellers, scrape_ms)
+    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
 
 # ------------------main------------------
@@ -194,21 +427,12 @@ def main():
     signal.signal(signal.SIGINT, _handle_signal)
 
     queue   = QueueService()
-    scraper = Scraper()
-    scraper.start()
+    scraper = Scraper()                 # Chrome is NOT started here — it is opened lazily
+    ctx     = WorkerContext(queue=queue, scraper=scraper)
 
-    oapv_template    = None
-    requests_session = None
-    session_id       = None
-    session_created_at = None
-
-    processed             = 0
-    captcha_count         = 0
-    empty_polls           = 0
-    session_expiry_fails  = 0
-    request_captcha_fails = 0
-    queue_empty_since     = None
-    start_time            = datetime.now()
+    empty_polls       = 0
+    queue_empty_since = None
+    start_time        = datetime.now()
     logger.info("Worker started")
 
     # Random startup delay to avoid all instances hitting Google simultaneously
@@ -245,196 +469,48 @@ def main():
                 logger.info("Messages arrived after %ds idle — resuming",
                             int((datetime.now() - queue_empty_since).total_seconds()))
             queue_empty_since = None
-
             empty_polls       = 0
-            pending           = list(messages)
 
-            # ------ Message 1: browser scrape — refreshes session ------
-            msg0 = messages[0]
-            try:
-                req0 = Request.from_message(json.loads(msg0["Body"]))
-            except Exception as e:
-                logger.error("Bad message: %s", e)
-                queue.delete_message(msg0)
-                pending.remove(msg0)
-                messages = messages[1:]
-            else:
-                logger.info("[%d] browser | client=%s strike_id=%s",
-                            processed + 1, req0.client_name, req0.strike_id)
-                try:
-                    t0 = datetime.now()
-                    sellers, captured_template = scraper.scrape_and_capture_template(
-                        req0.google_shopping_url, req0.seller_limit
-                    )
-                    scrape_ms = int((datetime.now() - t0).total_seconds() * 1000)
-                    if captured_template:
-                        oapv_template    = captured_template
-                        requests_session, session_id, session_created_at = new_session(scraper)
-                        logger.info("Session refreshed")
-                    send_and_delete(queue, msg0, req0, sellers, scrape_ms)
-                    pending.remove(msg0)
-                    processed += 1
-                    messages = messages[1:]
-                except CaptchaError:
-                    logger.warning("CAPTCHA on message 1 — restarting driver and retrying once")
-                    scraper.restart()
-                    try:
-                        t0 = datetime.now()
-                        sellers, captured_template = scraper.scrape_and_capture_template(
-                            req0.google_shopping_url, req0.seller_limit
-                        )
-                        scrape_ms = int((datetime.now() - t0).total_seconds() * 1000)
-                        if captured_template:
-                            oapv_template    = captured_template
-                            requests_session, session_id, session_created_at = new_session(scraper)
-                            logger.info("Session refreshed after driver restart")
-                        send_and_delete(queue, msg0, req0, sellers, scrape_ms)
-                        pending.remove(msg0)
-                        processed += 1
-                        messages = messages[1:]
-                    except CaptchaError:
-                        captcha_count += 1
-                        logger.error("CAPTCHA on message 1 after driver restart — terminating")
-                        captcha_terminate(queue, pending, scraper)
-                        break
-                except Exception as e:
-                    logger.error("Error on message 1 %s: %s", req0.strike_id, e, exc_info=True)
-                    _forward_on_error(queue, msg0)
-                    pending.remove(msg0)
-                    messages = messages[1:]
-
-            # ------ Messages 2-10: pure requests ------
+            # ------ parse the whole batch ------
+            ctx.pending = list(messages)
+            ctx.items   = deque()
             for msg in messages:
+                try:
+                    ctx.items.append(Item(msg=msg, req=Request.from_message(json.loads(msg["Body"]))))
+                except Exception as e:
+                    handle_bad_message(ctx, msg, e)
+
+            # ------ process one by one ------
+            while ctx.items:
                 if _shutdown or is_spot_interrupted():
                     break
-
+                ctx.queue.extend_visibility(ctx.pending)              # heartbeat before each message
+                item = ctx.items.popleft()
                 try:
-                    req = Request.from_message(json.loads(msg["Body"]))
-                except Exception as e:
-                    logger.error("Bad message: %s", e)
-                    queue.delete_message(msg)
-                    pending.remove(msg)
-                    continue
-
-                logger.info("[%d] requests | client=%s strike_id=%s",
-                            processed + 1, req.client_name, req.strike_id)
-
-                try:
-                    t0 = datetime.now()
-                    if oapv_template and requests_session:
-                        try:
-                            payload_t0 = datetime.now()
-                            sellers = scraper.scrape_via_requests(
-                                req.google_shopping_url,
-                                requests_session,
-                                oapv_template,
-                                req.seller_limit,
-                            )
-                            log_session_payload(
-                                session_id, req.strike_id,
-                                int((datetime.now() - payload_t0).total_seconds() * 1000)
-                            )
-                            session_expiry_fails  = 0
-                            request_captcha_fails = 0
-                        except SessionExpiredError:
-                            # Plain navigation doesn't re-establish OAPV-valid cookies — only a
-                            # full scrape (with the "More stores" click) does. Always restart
-                            # Chrome and do a full re-scrape rather than just refreshing cookies.
-                            logger.warning("Session expired on %s — restarting driver and refreshing session (%d/3)",
-                                           req.strike_id, session_expiry_fails + 1)
-                            log_session_expired(session_id, session_created_at)
-                            scraper.restart()
-                            try:
-                                sellers, new_template = scraper.scrape_and_capture_template(
-                                    req.google_shopping_url, req.seller_limit
-                                )
-                                if new_template:
-                                    oapv_template = new_template
-                                requests_session, session_id, session_created_at = new_session(scraper)
-                                session_expiry_fails = 0
-                                logger.info("Session refreshed via driver restart on %s", req.strike_id)
-                            except CaptchaError:
-                                session_expiry_fails += 1
-                                if session_expiry_fails >= 3:
-                                    raise CaptchaError(
-                                        f"Session refresh failed {session_expiry_fails} consecutive times"
-                                    )
-                                logger.warning("Session refresh retry failed — forwarding (%d/3)", session_expiry_fails)
-                                _forward_on_error(queue, msg)
-                                pending.remove(msg)
-                                continue
-                        except CaptchaError:
-                            logger.warning("Requests blocked on %s — refreshing browser (%d/3)",
-                                           req.strike_id, request_captcha_fails + 1)
-                            browser_sellers, new_template = _browser_navigate_with_retry(
-                                scraper, req.google_shopping_url, req.seller_limit
-                            )
-                            if new_template:
-                                oapv_template = new_template
-                            requests_session, session_id, session_created_at = new_session(scraper)
-                            if browser_sellers is not None:
-                                sellers = browser_sellers
-                                request_captcha_fails = 0
-                                logger.info("Session fully refreshed after driver restart on %s", req.strike_id)
-                            else:
-                                try:
-                                    payload_t0 = datetime.now()
-                                    sellers = scraper.scrape_via_requests(
-                                        req.google_shopping_url,
-                                        requests_session,
-                                        oapv_template,
-                                        req.seller_limit,
-                                    )
-                                    log_session_payload(
-                                        session_id, req.strike_id,
-                                        int((datetime.now() - payload_t0).total_seconds() * 1000)
-                                    )
-                                    request_captcha_fails = 0
-                                except (CaptchaError, SessionExpiredError):
-                                    request_captcha_fails += 1
-                                    if request_captcha_fails >= 3:
-                                        raise CaptchaError(
-                                            f"Requests captcha retry failed {request_captcha_fails} consecutive times"
-                                        )
-                                    logger.warning("Requests retry failed — forwarding (%d/3)", request_captcha_fails)
-                                    _forward_on_error(queue, msg)
-                                    pending.remove(msg)
-                                    continue
-                    else:
-                        sellers, captured_template = scraper.scrape_and_capture_template(
-                            req.google_shopping_url, req.seller_limit
-                        )
-                        if captured_template:
-                            oapv_template    = captured_template
-                            requests_session, session_id, session_created_at = new_session(scraper)
-                    scrape_ms = int((datetime.now() - t0).total_seconds() * 1000)
-                    send_and_delete(queue, msg, req, sellers, scrape_ms)
-                    pending.remove(msg)
-                    processed += 1
-                    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-
-                except CaptchaError:
-                    captcha_count += 1
-                    logger.error("CAPTCHA on %s after driver restart — terminating", req.strike_id)
-                    captcha_terminate(queue, pending, scraper)
+                    process_item(ctx, item)
+                except CaptchaPersistsError as e:
+                    ctx.captcha_count += 1
+                    logger.error("%s — terminating for a fresh IP", e)
+                    captcha_terminate(queue, ctx.pending, scraper)
                     break
-
                 except Exception as e:
-                    logger.error("Error processing %s: %s", req.strike_id, e, exc_info=True)
-                    _forward_on_error(queue, msg)
-                    pending.remove(msg)
+                    logger.error("Error processing %s: %s", item.req.strike_id, e, exc_info=True)
+                    if item.msg in ctx.pending:
+                        return_item(ctx, item)
 
             if _shutdown or is_spot_interrupted():
-                logger.warning("Returning %d unprocessed messages", len(pending))
-                for msg in pending:
-                    queue.return_message(msg)
+                if ctx.pending:
+                    logger.warning("Returning %d unprocessed messages", len(ctx.pending))
+                    for msg in list(ctx.pending):
+                        queue.return_message(msg)
+                    ctx.pending.clear()
                 break
 
     finally:
         scraper.stop()
         elapsed = datetime.now() - start_time
         logger.info("Worker stopped. processed=%d captchas=%d time=%s",
-                    processed, captcha_count, elapsed)
+                    ctx.processed, ctx.captcha_count, elapsed)
 
 
 if __name__ == "__main__":
