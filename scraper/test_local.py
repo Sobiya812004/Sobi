@@ -1,6 +1,12 @@
 """
-Local test — single scrape without SQS.
+Local test — single browser scrape without SQS.
 Usage: python -m worker.test_local [URL]
+
+Runs the same browser scrape that the Selenium fallback uses (need_session=True) and prints
+which fallback case the URL would fall into:
+  Case A  sellers + oapv template  -> a session would be collected
+  Case B  sellers, no template     -> sellers only, next input would be tried in the same Chrome
+  Case C  no sellers               -> the fallback would retry in a new Chrome, then FINAL NO_SELLERS
 """
 import sys
 import logging
@@ -23,8 +29,20 @@ def main():
     scraper.start()
 
     try:
-        sellers = scraper.scrape(url)
+        result = scraper.scrape_browser(url, need_session=True)
+        sellers = result.sellers
+
+        if sellers and result.oapv_template:
+            case = "A (sellers + oapv template -> session can be collected)"
+        elif sellers:
+            case = "B (sellers, no session -> try next input in the same Chrome)"
+        else:
+            case = f"C (no sellers, reason={result.no_sellers_reason or 'unknown'})"
+
         print(f"\n{'='*60}")
+        print(f"Fallback case: {case}")
+        print(f"More stores button: {result.has_more_stores}")
+        print(f"oapv template captured: {bool(result.oapv_template)}")
         print(f"Found {len(sellers)} sellers:")
         print(f"{'='*60}")
         for s in sellers:

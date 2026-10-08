@@ -11,7 +11,14 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
-from worker.scraper.config import PAGE_LOAD_WAIT, MAX_MORE_STORES_CLICKS, MAX_SELLERS
+import unicodedata
+from dataclasses import dataclass, field
+from typing import Optional
+
+from worker.scraper.config import (
+    PAGE_LOAD_WAIT, MAX_MORE_STORES_CLICKS, MAX_SELLERS,
+    OAPV_WAIT_TIMEOUT, ALLOW_NON_LATIN_SELLER_NAMES,
+)
 from worker.scraper.models import Seller
 
 logger = logging.getLogger(__name__)
@@ -42,13 +49,67 @@ class SessionExpiredError(CaptchaError):
     pass
 
 
+class ChromeInitError(RuntimeError):
+    """Chrome could not be started after all attempts."""
+
+
+@dataclass
+class BrowserResult:
+    """Outcome of one browser scrape of an input URL."""
+    sellers: list = field(default_factory=list)
+    oapv_template: Optional[str] = None   # set only after a "More stores" click produced an
+                                          # oapv response that contained sellers
+    has_more_stores: bool = False         # "More stores" button was present on the page
+    no_sellers_reason: str = ""           # why the page itself had no sellers (empty if it had)
+
+
+# Characters (besides ASCII letters/digits and Latin-1 letters) allowed in seller names.
+# "|" is deliberately NOT allowed: it is the field delimiter of the output format.
+_ALLOWED_NAME_CHARS = set("&?._@- ,(){}+[]':;/!\u00ae\u2122#%$*=\u2019\"")
+
+_chrome_cleanup_warned = False
+
+
+def kill_chrome_children():
+    """Kill chrome / chromedriver processes that are children of this worker.
+    Used to remove half-started processes after a failed Chrome start, and any leftovers
+    after quit. Only this worker's own children are touched (never a global pkill)."""
+    global _chrome_cleanup_warned
+    try:
+        import psutil
+    except ImportError:
+        if not _chrome_cleanup_warned:
+            logger.warning("psutil not installed — cannot clean up leftover chrome processes")
+            _chrome_cleanup_warned = True
+        return
+    try:
+        for child in psutil.Process().children(recursive=True):
+            try:
+                name = child.name().lower()
+                if "chrome" in name:          # matches chrome and chromedriver
+                    child.kill()
+                    logger.info("Killed leftover process %s (pid=%s)", name, child.pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception as e:
+        logger.debug("Chrome process cleanup error: %s", e)
+
+
+
 class Scraper:
 
     def __init__(self):
         self.driver = None
+        self.context = ""            # strike_id of the input being processed (for logs)
+        self._pending_oapv = {}      # requestId -> url, oapv bodies that were not ready yet
+
+    @property
+    def is_running(self) -> bool:
+        return self.driver is not None
 
     def start(self):
-        self.driver = self._init_driver()
+        if self.driver is None:
+            self.driver = self._init_driver()
 
     def stop(self):
         if self.driver:
@@ -57,10 +118,12 @@ class Scraper:
             except Exception:
                 pass
             self.driver = None
+        kill_chrome_children()
 
     def restart(self):
         self.stop()
         self.start()
+
 
     # ------------------public scrape methods------------------
 
@@ -81,20 +144,31 @@ class Scraper:
 
     def scrape(self, url: str, seller_limit: int = MAX_SELLERS) -> list[Seller]:
         """Browser scrape — returns sellers only."""
-        sellers, _ = self.scrape_and_capture_template(url, seller_limit)
-        return sellers
+        return self.scrape_browser(url, seller_limit).sellers
 
     def scrape_and_capture_template(self, url: str, seller_limit: int = MAX_SELLERS) -> tuple:
+        """Backward compatible wrapper: returns (sellers, oapv_template)."""
+        result = self.scrape_browser(url, seller_limit)
+        return result.sellers, result.oapv_template
+
+    def scrape_browser(self, url: str, seller_limit: int = MAX_SELLERS,
+                       need_session: bool = False) -> BrowserResult:
         """
-        Browser scrape. Returns (sellers, oapv_template).
-        - If More stores button found: clicks, captures oapv_template URL, fetches sellers via CDP.
-        - If no More stores: returns DOM sellers, oapv_template=None.
+        Browser scrape of one URL.
+        - If a "More stores" button is found: clicks it and waits (bounded polling) for the oapv
+          response. oapv_template is set only when that response contained sellers.
+        - If there is no "More stores" button: DOM sellers only, oapv_template=None.
+        - need_session=True: click "More stores" even when the DOM already has seller_limit
+          sellers, because the caller needs the oapv template to build a session.
         - If organic_offers_grid comes back with 0 items and no More stores button, the page
           load is retried up to MAX_GRID_RETRIES times before accepting it as a genuine
           no-sellers result.
+        Raises CaptchaError when the CAPTCHA page is shown.
         """
         all_sellers = []
         has_more_stores = False
+        no_sellers_reason = ""
+        self._pending_oapv.clear()
 
         for attempt in range(1, MAX_GRID_RETRIES + 1):
             self.driver.get(url)
@@ -104,15 +178,17 @@ class Scraper:
                 raise CaptchaError("CAPTCHA detected")
 
             if "Details aren't available for this product" in self.driver.page_source:
-                logger.info("'Details aren't available for this product' in page source — genuine NO_SELLERS, not retrying")
+                logger.info("'Details aren't available for this product' in page source")
                 all_sellers, grid_count = [], 0
                 has_more_stores = False
+                no_sellers_reason = "details_unavailable"
                 break
 
             if "Buying options" not in self.driver.page_source:
-                logger.info("'Buying options' not in page source — genuine NO_SELLERS, not retrying")
+                logger.info("'Buying options' not in page source")
                 all_sellers, grid_count = [], 0
                 has_more_stores = False
+                no_sellers_reason = "no_buying_options"
                 break
 
             all_sellers, grid_count = self._get_sellers_from_page()
@@ -134,30 +210,40 @@ class Scraper:
                 time.sleep(GRID_RETRY_DELAY_SEC)
             else:
                 logger.info(
-                    "0 items in organic_offers_grid after %d attempts — accepting as genuine NO_SELLERS",
+                    "0 items in organic_offers_grid after %d attempts — no sellers",
                     MAX_GRID_RETRIES,
                 )
+                no_sellers_reason = "empty_grid"
 
         oapv_template = None
 
-        if has_more_stores and len(all_sellers) < seller_limit:
+        if has_more_stores and (len(all_sellers) < seller_limit or need_session):
             logger.info("More stores button found — clicking and capturing oapv")
             seen_urls = set()
             for data, template_url in self._click_more_stores_with_url(seen_urls):
-                all_sellers.extend(self._extract_sellers(data))
-                if oapv_template is None:
+                extracted = self._extract_sellers(data)
+                all_sellers.extend(extracted)
+                if oapv_template is None and extracted:
                     oapv_template = template_url
-                    logger.info("oapv_template captured")
-                if len(all_sellers) >= seller_limit:
+                    logger.info("oapv_template captured (oapv response with %d sellers)", len(extracted))
+                if len(all_sellers) >= seller_limit and oapv_template:
                     break
+            if oapv_template is None:
+                logger.warning("More stores clicked but no oapv response with sellers was captured")
         else:
-            logger.info("No More stores button — DOM sellers only")
+            logger.info("No More stores click — DOM sellers only")
 
         all_sellers = self._deduplicate(all_sellers)
         all_sellers.sort(
             key=lambda s: float(s.price) if s.price.replace(".", "", 1).isdigit() else 999999
         )
-        return all_sellers[:seller_limit], oapv_template
+        return BrowserResult(
+            sellers=all_sellers[:seller_limit],
+            oapv_template=oapv_template,
+            has_more_stores=has_more_stores,
+            no_sellers_reason=no_sellers_reason if not all_sellers else "",
+        )
+
 
     def scrape_via_requests(self, url: str, session, oapv_template: str,
                         seller_limit: int = MAX_SELLERS) -> list[Seller]:
@@ -269,7 +355,6 @@ class Scraper:
         return all_sellers[:seller_limit]
 
     # ------------------internal helpers------------------
-
     def _init_driver(self, retries=3):
         for attempt in range(1, retries + 1):
             try:
@@ -301,8 +386,12 @@ class Scraper:
                 return driver
             except Exception as e:
                 logger.error("Chrome init failed (attempt %d): %s", attempt, e)
+                # A failed start can leave a half-started chrome/chromedriver process
+                # (no driver object was returned, so nothing can call quit() on it).
+                kill_chrome_children()
                 time.sleep(5)
-        raise RuntimeError("Failed to start Chrome")
+        raise ChromeInitError("Failed to start Chrome")
+
 
     def redirect_goto(self, url):
         if not url:
@@ -328,12 +417,33 @@ class Scraper:
         return url
 
     def clean_seller_name(self, seller) -> str:
+        """Return the seller name, or "" when it contains a character that is not allowed.
+        Every rejected non-empty name is logged at WARNING so that lost sellers are visible."""
         if seller is None:
             return ""
         seller = str(seller).strip()
-        if not re.fullmatch(r"[A-Za-zÀ-ÿ0-9&?._@\- ,(){}+[':;]+", seller):
+        if not seller:
+            return ""
+        bad = {ch for ch in seller if not self._is_allowed_name_char(ch)}
+        if bad:
+            logger.warning("SELLER_NAME_REJECTED strike_id=%s name=%r bad_chars=%r",
+                           self.context, seller, "".join(sorted(bad)))
             return ""
         return seller
+
+    @staticmethod
+    def _is_allowed_name_char(ch: str) -> bool:
+        if ch.isascii() and ch.isalnum():
+            return True
+        if "\u00c0" <= ch <= "\u00ff":
+            return True
+        if ch in _ALLOWED_NAME_CHARS:
+            return True
+        if ALLOW_NON_LATIN_SELLER_NAMES:
+            # any letter or combining mark (e.g. Tamil vowel signs) in any script
+            return unicodedata.category(ch)[0] in ("L", "M")
+        return False
+
 
     def _get_sellers_from_page(self) -> tuple:
         """Returns (sellers, grid_item_count)."""
@@ -381,7 +491,9 @@ class Scraper:
         return sellers, grid_count
 
     def _click_more_stores_with_url(self, seen_urls: set):
-        """Click More stores repeatedly, yield (data, oapv_url) for each new oapv response."""
+        """Click More stores repeatedly, yield (data, oapv_url) for each new oapv response.
+        After every click the network log is polled (bounded by OAPV_WAIT_TIMEOUT) until the
+        oapv response arrives — a click alone is not treated as success."""
         more_stores_locator = (By.XPATH, "//div[@role='button'][contains(., 'More stores')]")
         for i in range(MAX_MORE_STORES_CLICKS):
             try:
@@ -391,15 +503,24 @@ class Scraper:
                 self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
                 time.sleep(1)
                 self.driver.execute_script("arguments[0].click();", btn)
-                logger.info("Clicked 'More stores' #%d", i + 1)
+                logger.info("MORE_STORES_CLICKED #%d", i + 1)
+
+                captured = False
+                for item in self._poll_oapv(seen_urls, OAPV_WAIT_TIMEOUT):
+                    captured = True
+                    yield item
+                if captured:
+                    logger.info("OAPV_CAPTURED after click #%d", i + 1)
+                else:
+                    logger.warning("No oapv response within %ds after click #%d", OAPV_WAIT_TIMEOUT, i + 1)
+
                 button_still_present = True
                 try:
                     WebDriverWait(self.driver, 3).until(
                         EC.element_to_be_clickable(more_stores_locator)
                     )
                 except TimeoutException:
-                    button_still_present = False  # no more stores — avoid re-waiting next loop
-                yield from self._get_oapv_data_with_url(seen_urls)
+                    button_still_present = False  # no more stores
                 if not button_still_present:
                     break
             except TimeoutException:
@@ -408,8 +529,23 @@ class Scraper:
                 logger.error("Error clicking More stores: %s", e)
                 break
 
+    def _poll_oapv(self, seen_urls: set, timeout: float):
+        """Poll the network log until at least one oapv response was read or timeout expires."""
+        deadline = time.time() + timeout
+        while True:
+            got = False
+            for item in self._get_oapv_data_with_url(seen_urls):
+                got = True
+                yield item
+            if got or time.time() >= deadline:
+                return
+            time.sleep(0.5)
+
     def _get_oapv_data_with_url(self, seen_urls: set):
-        """Yield (data, url) for each new oapv response in network logs."""
+        """Yield (data, url) for each new oapv response in network logs.
+        A response whose body is not available yet is remembered and retried on the next poll."""
+        entries = list(self._pending_oapv.items())     # [(request_id, url)]
+        self._pending_oapv.clear()
         for log in self.driver.get_log("performance"):
             try:
                 msg = json.loads(log["message"])["message"]
@@ -419,8 +555,14 @@ class Scraper:
                 if "async/oapv" not in url or url in seen_urls:
                     continue
                 seen_urls.add(url)
+                entries.append((msg["params"]["requestId"], url))
+            except Exception as e:
+                logger.debug("Skipping unreadable log entry: %s", e)
+
+        for request_id, url in entries:
+            try:
                 body = self.driver.execute_cdp_cmd(
-                    "Network.getResponseBody", {"requestId": msg["params"]["requestId"]}
+                    "Network.getResponseBody", {"requestId": request_id}
                 )
                 lines = body["body"].splitlines()
                 if len(lines) <= 1:
@@ -430,8 +572,11 @@ class Scraper:
                     continue
                 yield json.loads(content), url
             except Exception as e:
-                if "No resource with given identifier" not in str(e):
+                if "No resource with given identifier" in str(e):
+                    self._pending_oapv[request_id] = url      # body not ready yet — retry
+                else:
                     logger.error("Failed to get oapv body: %s", e)
+
 
     @staticmethod
     def _extract_product_tokens(html: str, gpcid: str) -> tuple:
