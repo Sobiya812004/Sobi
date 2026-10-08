@@ -16,12 +16,12 @@ from typing import Optional
 from worker.scraper.config import (
     IMDS_TOKEN_URL, IMDS_INSTANCE_URL, IMDS_SPOT_URL,
     DELAY_MIN, DELAY_MAX, AWS_REGION, QUEUE_IDLE_TIMEOUT, VISIBILITY_TIMEOUT,
-    NO_SELLER_RETRY, MAX_RETRIES, MAX_QUEUE_RETRIES, BATCH_SESSION, BATCH_TIME_LIMIT_SEC,
+    NO_SELLER_RETRY, MAX_RETRIES, BATCH_SESSION, BATCH_TIME_LIMIT_SEC,
     CAPTCHA_MAX_RETRIES, CAPTCHA_DELAY_MIN, CAPTCHA_DELAY_MAX,
 )
 from worker.scraper.models import Request, Product, Session
 from worker.scraper.scraper import Scraper, CaptchaError, SessionExpiredError, ChromeInitError
-from worker.scraper.queue_service import QueueService, strike_id_of, receive_count_of
+from worker.scraper.queue_service import QueueService, strike_id_of
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,10 +114,7 @@ ID_PATTERN = re.compile(r"(gpcid|catalogid):\d+")
 
 
 class CaptchaPersistsError(Exception):
-    """CAPTCHA was still shown after all retries with a new Chrome. `item` is the input that hit it."""
-    def __init__(self, message, item=None):
-        super().__init__(message)
-        self.item = item
+    """CAPTCHA was still shown after all retries with a new Chrome."""
 
 
 @dataclass
@@ -203,8 +200,8 @@ def format_output(sellers) -> str:
     return f"{date_str}|{sellers_str}"
 
 
-def send_and_delete(queue, msg, req, sellers, scrape_ms: int = 0, status: Optional[str] = None):
-    status  = status or ("OK" if sellers else "NO_SELLERS")
+def send_and_delete(queue, msg, req, sellers, scrape_ms: int = 0):
+    status  = "OK" if sellers else "NO_SELLERS"
     output  = format_output(sellers) if sellers else None
     product = Product.from_request(req, output, status)
     queue.send_output(product)
@@ -219,36 +216,6 @@ def finish(ctx: WorkerContext, item: Item, sellers, scrape_ms: int = 0):
     if item.msg in ctx.pending:
         ctx.pending.remove(item.msg)
     ctx.processed += 1
-
-
-def close_with_status(ctx: WorkerContext, item: Item, status: str, reason: str):
-    """Finish an input that could not be scraped. The output is sent with the status (ERROR or
-    CAPTCHA) and the message is deleted, so it never goes back to the queue and never to the DLQ.
-    Only if that output cannot be sent the message is returned so that it is not lost."""
-    logger.error("Input closed with status %s strike_id %s reason %s", status, item.req.strike_id, reason)
-    try:
-        send_and_delete(ctx.queue, item.msg, item.req, [], 0, status=status)
-        ctx.processed += 1
-    except Exception as e:
-        logger.error("Status %s output could not be sent so the input is returned strike_id %s %s",
-                     status, item.req.strike_id, e)
-        ctx.queue.return_message(item.msg)
-    if item.msg in ctx.pending:
-        ctx.pending.remove(item.msg)
-
-
-def fail_or_retry(ctx: WorkerContext, item: Item, status: str, reason: str):
-    """An input failed (error or CAPTCHA). It goes back to the input queue and is tried again, at
-    most MAX_QUEUE_RETRIES times. Only when it still fails after that it is closed with the status
-    (ERROR or CAPTCHA), the output is sent and the message is deleted."""
-    count = receive_count_of(item.msg)
-    if count <= MAX_QUEUE_RETRIES:
-        logger.warning("Input returned to the input queue for retry number %d of %d strike_id %s reason %s",
-                       count, MAX_QUEUE_RETRIES, item.req.strike_id, reason)
-        return_item(ctx, item)
-        return
-    logger.error("Input failed after %d queue retries strike_id %s", MAX_QUEUE_RETRIES, item.req.strike_id)
-    close_with_status(ctx, item, status, reason)
 
 
 def return_item(ctx: WorkerContext, item: Item):
@@ -284,18 +251,15 @@ def find_request_problem(req: Request) -> Optional[str]:
 
 
 def handle_bad_message(ctx: WorkerContext, msg: dict, reason: str):
-    """A message with the wrong input format is never processed. It is logged as a bad message
-    and sent to the DLQ, then deleted from the input queue. If the DLQ send fails it is returned
-    to the input queue so it is not lost (SQS then moves it to the DLQ after maxReceiveCount).
-    The notification for wrong input is sent by the dispatcher, not here."""
-    logger.error("Bad messages found message id %s reason %s body %s", msg.get("MessageId"), reason, msg.get("Body"))
-    if ctx.queue.send_to_dlq(msg, reason):
-        logger.info("Bad messages sent to DLQ message id %s", msg.get("MessageId"))
-        ctx.queue.delete_message(msg)
-    else:
-        logger.error("Bad messages DLQ send failed so it is returned to the input queue message id %s",
-                     msg.get("MessageId"))
-        ctx.queue.return_message(msg)
+    """A message with the wrong input format is never processed and never goes back to the input
+    queue or to a DLQ. An alert is sent to the notification queue and the message is deleted."""
+    body = msg.get("Body", "")
+    logger.error("Bad message %s reason %s body %s", msg.get("MessageId"), reason, body)
+    text = (f"ALERT\nInput format is wrong. The message was not processed and was removed.\n"
+            f"Message id {msg.get('MessageId')}\nReason {reason}\nBody {body[:1500]}")
+    sent = ctx.queue.send_alert(text)
+    logger.info("Bad message alert sent %s message id %s", sent, msg.get("MessageId"))
+    ctx.queue.delete_message(msg)
     if msg in ctx.pending:
         ctx.pending.remove(msg)
 
@@ -323,10 +287,9 @@ def handle_batch_timeout(ctx: WorkerContext):
 
 
 def captcha_terminate(ctx: WorkerContext):
-    """CAPTCHA persists even with a new Chrome. The CAPTCHA input was already handled by the caller
-    (returned for a retry or closed with status CAPTCHA). Every other unfinished input of the batch goes back to the input queue
-    without any marking, Chrome is stopped and this instance is terminated so the ASG launches a
-    replacement with a fresh IP."""
+    """CAPTCHA persists even with a new Chrome. Return the CAPTCHA input and every other unfinished
+    input of the batch to the input queue without any marking, stop Chrome and terminate this
+    instance so the ASG launches a replacement with a fresh IP."""
     logger.error("Captcha persists after %d retries returning %d inputs strike ids %s",
                  CAPTCHA_MAX_RETRIES, len(ctx.pending), strikes_of(ctx.pending))
     return_all_pending(ctx)
@@ -398,7 +361,7 @@ def run_selenium_fallback(ctx: WorkerContext, first: Item, trigger: str):
                 if ctx.timed_out.is_set():
                     return
                 if captcha_retries >= CAPTCHA_MAX_RETRIES:
-                    raise CaptchaPersistsError(f"CAPTCHA persists on strike id {req.strike_id}", current)
+                    raise CaptchaPersistsError(f"CAPTCHA persists on strike id {req.strike_id}")
                 captcha_retries += 1
                 wait = random.uniform(CAPTCHA_DELAY_MIN, CAPTCHA_DELAY_MAX)
                 logger.warning("CAPTCHA_RETRY(%d/%d) strike_id %s",
@@ -415,7 +378,7 @@ def run_selenium_fallback(ctx: WorkerContext, first: Item, trigger: str):
                 if ctx.timed_out.is_set():
                     return
                 logger.error("Selenium error strike_id %s %s", req.strike_id, e, exc_info=True)
-                fail_or_retry(ctx, current, "ERROR", f"selenium error {type(e).__name__} {e}")
+                return_item(ctx, current)
                 return
 
             try:
@@ -475,7 +438,7 @@ def run_selenium_fallback(ctx: WorkerContext, first: Item, trigger: str):
                 if ctx.timed_out.is_set():
                     return
                 logger.error("Error finishing strike_id %s %s", req.strike_id, e, exc_info=True)
-                fail_or_retry(ctx, current, "ERROR", f"error while finishing {type(e).__name__} {e}")
+                return_item(ctx, current)
                 return
     except ChromeInitError as e:
         logger.error("Chrome could not be started %s", e)
@@ -518,10 +481,10 @@ def process_item(ctx: WorkerContext, item: Item):
             ctx.fresh_fail += 1
             logger.warning("Fresh session failed on first use count %d", ctx.fresh_fail)
             if ctx.fresh_fail >= 2:
-                logger.error("Fresh session failed %d times in a row so strike_id %s is not tried again with Chrome now",
+                logger.error("Fresh session failed %d times in a row returning strike_id %s without opening Chrome",
                              ctx.fresh_fail, req.strike_id)
                 ctx.fresh_fail = 0
-                fail_or_retry(ctx, item, "ERROR", "fresh session failed on first use twice in a row")
+                return_item(ctx, item)
                 return
         run_selenium_fallback(ctx, item, trigger="session_expired")
         return
@@ -602,8 +565,6 @@ def run_batch(ctx: WorkerContext, messages: list):
             except CaptchaPersistsError as e:
                 ctx.captcha_count += 1
                 logger.error("%s so this instance is terminated for a fresh IP", e)
-                if e.item is not None:
-                    fail_or_retry(ctx, e.item, "CAPTCHA", "captcha persists after all retries")
                 captcha_terminate(ctx)
                 break
             except Exception as e:
@@ -611,7 +572,7 @@ def run_batch(ctx: WorkerContext, messages: list):
                     break                    # stays pending and is returned below
                 logger.error("Error processing strike_id %s %s", item.req.strike_id, e, exc_info=True)
                 if item.msg in ctx.pending:
-                    fail_or_retry(ctx, item, "ERROR", f"{type(e).__name__} {e}")
+                    return_item(ctx, item)
     finally:
         watchdog.cancel()
 

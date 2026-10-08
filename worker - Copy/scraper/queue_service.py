@@ -4,7 +4,7 @@ import boto3
 from dataclasses import asdict
 
 from worker.scraper.config import (
-    AWS_REGION, INPUT_QUEUE_URL, OUTPUT_QUEUE_URL, DLQ_URL,
+    AWS_REGION, INPUT_QUEUE_URL, OUTPUT_QUEUE_URL, NOTIFICATION_PARAM,
     MAX_MESSAGES, VISIBILITY_TIMEOUT, WAIT_TIME_SECONDS,
 )
 from worker.scraper.models import Product
@@ -20,18 +20,11 @@ def strike_id_of(msg: dict) -> str:
         return str(msg.get("MessageId", "unknown"))
 
 
-def receive_count_of(msg: dict) -> int:
-    """How many times SQS has delivered this message (1 on the first delivery)."""
-    try:
-        return int(msg.get("Attributes", {}).get("ApproximateReceiveCount", 1))
-    except Exception:
-        return 1
-
-
 class QueueService:
 
     def __init__(self):
         self.sqs = boto3.client("sqs", region_name=AWS_REGION)
+        self._notification_url = None
 
     def receive_messages(self) -> list[dict]:
         if not INPUT_QUEUE_URL:
@@ -71,25 +64,19 @@ class QueueService:
         except Exception as e:
             logger.error("Failed to return message: %s", e)
 
-    def send_to_dlq(self, msg: dict, reason: str) -> bool:
-        """Send a bad message (wrong input format) to the DLQ with the reason as a message
-        attribute. Returns True only when it is stored, so the caller may then delete it from the
-        input queue. Never raises."""
-        if not DLQ_URL:
-            logger.error("DLQ url is not known so the bad message cannot be sent")
-            return False
+    def send_alert(self, text: str) -> bool:
+        """Post an alert to the notification queue (the same queue the dispatcher posts to).
+        Never raises. Returns True when the alert was sent."""
         try:
-            self.sqs.send_message(
-                QueueUrl=DLQ_URL,
-                MessageBody=msg.get("Body", ""),
-                MessageAttributes={
-                    "failure_reason": {"DataType": "String", "StringValue": (reason or "unknown")[:500]},
-                    "source_message_id": {"DataType": "String", "StringValue": str(msg.get("MessageId", ""))},
-                },
-            )
+            if self._notification_url is None:
+                ssm = boto3.client("ssm", region_name=AWS_REGION)
+                self._notification_url = ssm.get_parameter(
+                    Name=NOTIFICATION_PARAM, WithDecryption=True
+                )["Parameter"]["Value"]
+            self.sqs.send_message(QueueUrl=self._notification_url, MessageBody=text)
             return True
         except Exception as e:
-            logger.error("Bad message could not be sent to the DLQ %s", e)
+            logger.error("Alert could not be sent %s", e)
             return False
 
     def delete_message(self, msg: dict):

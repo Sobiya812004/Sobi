@@ -1,0 +1,100 @@
+{
+  "officesupply": {
+    "url_column": 2,
+    "seller_limit": 25,
+    "seller_fields": [
+      "name",
+      "price",
+      "shipping",
+      "url",
+      "stock",
+      "rating",
+      "reviews",
+      "condition"
+    ]
+  },
+  "decorprice": {
+    "url_column": 17,
+    "seller_limit": 25,
+    "seller_fields": [
+      "name",
+      "price",
+      "shipping",
+      "url",
+      "stock",
+      "rating",
+      "reviews",
+      "condition"
+    ]
+  },
+  "nomadicsupply": {
+    "url_column": 8,
+    "seller_limit": 25,
+    "seller_fields": [
+      "name",
+      "price",
+      "shipping",
+      "url",
+      "stock",
+      "rating",
+      "reviews",
+      "condition"
+    ]
+  },
+  "djdeals": {
+    "url_column": 5,
+    "seller_limit": 25,
+    "seller_fields": [
+      "name",
+      "price",
+      "shipping",
+      "url",
+      "stock",
+      "rating",
+      "reviews",
+      "condition"
+    ]
+  },
+  "techforless": {
+    "url_column": 9,
+    "seller_limit": 25,
+    "seller_fields": [
+      "name",
+      "price",
+      "shipping",
+      "url",
+      "stock",
+      "rating",
+      "reviews",
+      "condition"
+    ]
+  },
+  "swp": {
+    "url_column": 18,
+    "seller_limit": 25,
+    "seller_fields": [
+      "name",
+      "price",
+      "shipping",
+      "url",
+      "stock",
+      "rating",
+      "reviews",
+      "condition"
+    ]
+  },
+  "wholesalepoint": {
+    "url_column": 13,
+    "seller_limit": 25,
+    "seller_fields": [
+      "name",
+      "price",
+      "shipping",
+      "url",
+      "stock",
+      "rating",
+      "reviews",
+      "condition"
+    ]
+  }
+}

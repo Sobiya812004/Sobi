@@ -62,6 +62,12 @@ class BrowserResult:
     has_more_stores: bool = False         # "More stores" button was present on the page
     no_sellers_reason: str = ""           # why the page itself had no sellers (empty if it had)
 
+
+# Characters (besides ASCII letters/digits and Latin-1 letters) allowed in seller names.
+# "|" and tab never reach this filter: like in the old code they are replaced by a space
+# before the name is cleaned, so a seller name with "|" is kept (with a space instead).
+_ALLOWED_NAME_CHARS = set("&?._@- ,(){}+[]':;/!\u00ae\u2122#%$*=\u2019\"")
+
 _chrome_cleanup_warned = False
 
 
@@ -179,14 +185,14 @@ class Scraper:
                 raise CaptchaError("CAPTCHA detected")
 
             if "Details aren't available for this product" in self.driver.page_source:
-                logger.info("Page shows details are not available for this product in page source")
+                logger.info("Page shows details are not available for this product")
                 all_sellers, grid_count = [], 0
                 has_more_stores = False
                 no_sellers_reason = "details_unavailable"
                 break
 
             if "Buying options" not in self.driver.page_source:
-                logger.info("Page has no Buying options in page source")
+                logger.info("Page has no Buying options")
                 all_sellers, grid_count = [], 0
                 has_more_stores = False
                 no_sellers_reason = "no_buying_options"
@@ -418,13 +424,33 @@ class Scraper:
         return url
 
     def clean_seller_name(self, seller) -> str:
+        """Return the seller name, or "" when it contains a character that is not allowed.
+        Every rejected non-empty name is logged at WARNING so that lost sellers are visible."""
         if seller is None:
             return ""
         seller = str(seller).strip()
-        if not re.fullmatch(r"[A-Za-zÀ-ÿ0-9&?._@\|%$^`- ,(){}+[':;]+", seller):
-            logger.info(f"SELLER_NAME_REJECTED name {seller}")
+        if not seller:
+            return ""
+        bad = {ch for ch in seller if not self._is_allowed_name_char(ch)}
+        if bad:
+            logger.warning("SELLER_NAME_REJECTED strike_id %s name %s bad_chars %s",
+                           self.context, seller, "".join(sorted(bad)))
             return ""
         return seller
+
+    @staticmethod
+    def _is_allowed_name_char(ch: str) -> bool:
+        if ch.isascii() and ch.isalnum():
+            return True
+        if "\u00c0" <= ch <= "\u00ff":
+            return True
+        if ch in _ALLOWED_NAME_CHARS:
+            return True
+        if ALLOW_NON_LATIN_SELLER_NAMES:
+            # any letter or combining mark (e.g. Tamil vowel signs) in any script
+            return unicodedata.category(ch)[0] in ("L", "M")
+        return False
+
 
     def _get_sellers_from_page(self) -> tuple:
         """Returns (sellers, grid_item_count)."""
@@ -557,6 +583,7 @@ class Scraper:
                     self._pending_oapv[request_id] = url      # body not ready yet — retry
                 else:
                     logger.error("Failed to get oapv body: %s", e)
+
 
     @staticmethod
     def _extract_product_tokens(html: str, gpcid: str) -> tuple:

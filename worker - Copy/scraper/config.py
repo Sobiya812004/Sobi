@@ -5,13 +5,9 @@ ENV                     = os.getenv("ENV", "dev")
 INPUT_QUEUE_URL         = os.getenv("INPUT_QUEUE_URL", "")
 OUTPUT_QUEUE_URL        = os.getenv("OUTPUT_QUEUE_URL")
 
-# DLQ of this client. Bad messages (wrong input format) are sent here by the worker.
-# By default it is derived from the input queue URL (...-input-queue -> ...-input-dlq).
-def _derive_dlq_url(input_url: str) -> str:
-    suffix = "-input-queue"
-    return input_url[:-len(suffix)] + "-input-dlq" if input_url.endswith(suffix) else ""
-
-DLQ_URL                 = os.getenv("DLQ_URL") or _derive_dlq_url(INPUT_QUEUE_URL)
+# Notification queue used for alerts (same queue the dispatcher posts to). Its URL is read
+# from this SSM parameter.
+NOTIFICATION_PARAM      = f"/google-scraper-engine/{ENV}/notification_sqs_url"
 
 # Time (seconds) to stay alive after the queue empties before scaling down.
 QUEUE_IDLE_TIMEOUT      = int(os.getenv("QUEUE_IDLE_TIMEOUT", "30"))
@@ -29,13 +25,7 @@ DELAY_MIN            = int(os.getenv("DELAY_MIN", "1"))
 DELAY_MAX            = int(os.getenv("DELAY_MAX", "3"))
 
 # Seconds to wait (polling) for the oapv response after a "More stores" click.
-OAPV_WAIT_TIMEOUT    = int(os.getenv("OAPV_WAIT_TIMEOUT", "5"))
-
-# An input that fails (error or CAPTCHA) goes back to the input queue and is tried again. It is
-# returned at most MAX_QUEUE_RETRIES times. If it still fails after that it is closed with status
-# ERROR or CAPTCHA (output sent and the message deleted). SQS redrive maxReceiveCount of the input
-# queue must be bigger than MAX_QUEUE_RETRIES + 1 or the message goes to the DLQ before that.
-MAX_QUEUE_RETRIES    = int(os.getenv("MAX_QUEUE_RETRIES", "3"))
+OAPV_WAIT_TIMEOUT    = int(os.getenv("OAPV_WAIT_TIMEOUT", "10"))
 
 # NO_SELLER handling flag.
 #   true  : a NO_SELLER from the request method is checked again with Chrome, and a Chrome
